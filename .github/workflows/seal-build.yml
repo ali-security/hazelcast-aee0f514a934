@@ -1,0 +1,228 @@
+name: seal-build
+
+# Hazelcast 3.12.x ships no GitHub Actions CI. This workflow mirrors the
+# project's own Maven build (`mvn clean install`, JDK 8 -> jdk-8 profile) and
+# its PR-builder test profile (`-PparallelTest`: QuickTest group, ParallelTest
+# classes in 0.5C forks + the rest in a single JVM). The QuickTest suite is too
+# large for one job, so it is sharded by test package across a matrix; the
+# last shard of each module is a catch-all so every test class runs.
+
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Surefire -Dtest selector; empty runs the full suite"
+        required: false
+        default: ""
+
+env:
+  MAVEN_VERSION: 3.9.5
+  # Values baked into GeneratedBuildProperties of the public 3.12.6 release.
+  BUILD_PROPS: -Dtimestamp=20200130 -Dgit.commit.id.abbrev=be02cc5
+  TEST_PROPS: -PparallelTest -Djacoco.skip=true -DjacocoArgLine= -DfailIfNoTests=false -Dsurefire.failIfNoSpecifiedTests=false
+  EXCL: "!**/jsr/**, !**/*IT, !**/mapreduce/**"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "8"
+          cache: maven
+      - name: Install Maven ${{ env.MAVEN_VERSION }} and settings
+        run: |
+          cat > "$RUNNER_TEMP/skipped_report.py" <<'PYEOF'
+          """Print every skipped test (with its reason) and a pass/fail tally from the
+          Surefire XML reports, so the job log names each skip instead of only a count."""
+          import glob
+          import xml.etree.ElementTree as ET
+
+          totals = {"tests": 0, "failures": 0, "errors": 0, "skipped": 0}
+          skipped = []
+          for path in sorted(glob.glob("**/target/surefire-reports/TEST-*.xml", recursive=True)):
+              try:
+                  root = ET.parse(path).getroot()
+              except ET.ParseError:
+                  continue
+              for key in totals:
+                  totals[key] += int(root.get(key, "0") or 0)
+              for case in root.iter("testcase"):
+                  node = case.find("skipped")
+                  if node is not None:
+                      reason = node.get("message") or (node.text or "").strip() or "no message (@Ignore / assumption)"
+                      skipped.append("%s.%s: %s" % (case.get("classname"), case.get("name"), reason))
+
+          for line in skipped:
+              print("SKIPPED " + line)
+          passed = totals["tests"] - totals["failures"] - totals["errors"] - totals["skipped"]
+          print(
+              "Surefire totals: tests=%d passed=%d failures=%d errors=%d skipped=%d"
+              % (totals["tests"], passed, totals["failures"], totals["errors"], totals["skipped"])
+          )
+          PYEOF
+          curl -fsSL "https://archive.apache.org/dist/maven/maven-3/${MAVEN_VERSION}/binaries/apache-maven-${MAVEN_VERSION}-bin.tar.gz" | tar xz -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/apache-maven-${MAVEN_VERSION}/bin" >> "$GITHUB_PATH"
+          cat > "$RUNNER_TEMP/settings.xml" <<'EOF'
+          <settings>
+            <mirrors>
+              <mirror>
+                <id>sonatype-snapshots-retired</id>
+                <mirrorOf>snapshot-repository</mirrorOf>
+                <url>https://repo.maven.apache.org/maven2</url>
+              </mirror>
+            </mirrors>
+          </settings>
+          EOF
+      - name: Build (mvn clean install)
+        env:
+          FILTER: ${{ inputs.test-filter }}
+        run: |
+          java -version
+          mvn -version
+          if [ -n "$FILTER" ]; then
+            mvn -B -s "$RUNNER_TEMP/settings.xml" clean install $BUILD_PROPS $TEST_PROPS "-Dtest=$FILTER"
+          else
+            # tests run in the test-shard matrix below
+            mvn -B -s "$RUNNER_TEMP/settings.xml" clean install $BUILD_PROPS -DskipTests
+          fi
+      - name: List skipped tests with reasons
+        if: always() && inputs.test-filter != ''
+        run: python3 "$RUNNER_TEMP/skipped_report.py"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hazelcast-all-jar
+          path: hazelcast-all/target/hazelcast-all-3.12.6.jar
+          if-no-files-found: error
+
+  test:
+    if: inputs.test-filter == ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - shard: core-map-impl
+            module: hazelcast
+            tests: "com/hazelcast/map/impl/**/*"
+          - shard: core-map-other
+            module: hazelcast
+            tests: "com/hazelcast/map/**/*, !com/hazelcast/map/impl/**"
+          - shard: core-internal-a
+            module: hazelcast
+            tests: "com/hazelcast/internal/serialization/**/*, com/hazelcast/internal/util/**/*, com/hazelcast/internal/partition/**/*, com/hazelcast/internal/management/**/*, com/hazelcast/internal/cluster/**/*"
+          - shard: core-internal-b
+            module: hazelcast
+            tests: "com/hazelcast/internal/**/*, !com/hazelcast/internal/serialization/**, !com/hazelcast/internal/util/**, !com/hazelcast/internal/partition/**, !com/hazelcast/internal/management/**, !com/hazelcast/internal/cluster/**"
+          - shard: core-spi
+            module: hazelcast
+            tests: "com/hazelcast/spi/**/*"
+          - shard: core-config
+            module: hazelcast
+            tests: "com/hazelcast/config/**/*"
+          - shard: core-query
+            module: hazelcast
+            tests: "com/hazelcast/query/**/*"
+          - shard: core-cache
+            module: hazelcast
+            tests: "com/hazelcast/cache/**/*"
+          - shard: core-cp-quorum
+            module: hazelcast
+            tests: "com/hazelcast/cp/**/*, com/hazelcast/quorum/**/*"
+          - shard: core-client-nio-util
+            module: hazelcast
+            tests: "com/hazelcast/client/**/*, com/hazelcast/nio/**/*, com/hazelcast/util/**/*, com/hazelcast/concurrent/**/*"
+          - shard: core-datastructures
+            module: hazelcast
+            tests: "com/hazelcast/collection/**/*, com/hazelcast/replicatedmap/**/*, com/hazelcast/ringbuffer/**/*, com/hazelcast/topic/**/*, com/hazelcast/multimap/**/*, com/hazelcast/executor/**/*, com/hazelcast/scheduledexecutor/**/*, com/hazelcast/durableexecutor/**/*"
+          - shard: core-rest
+            module: hazelcast
+            tests: "**/*, !com/hazelcast/map/**, !com/hazelcast/internal/**, !com/hazelcast/spi/**, !com/hazelcast/config/**, !com/hazelcast/query/**, !com/hazelcast/cache/**, !com/hazelcast/cp/**, !com/hazelcast/quorum/**, !com/hazelcast/client/**, !com/hazelcast/nio/**, !com/hazelcast/util/**, !com/hazelcast/concurrent/**, !com/hazelcast/collection/**, !com/hazelcast/replicatedmap/**, !com/hazelcast/ringbuffer/**, !com/hazelcast/topic/**, !com/hazelcast/multimap/**, !com/hazelcast/executor/**, !com/hazelcast/scheduledexecutor/**, !com/hazelcast/durableexecutor/**"
+          - shard: client-cache
+            module: hazelcast-client
+            tests: "com/hazelcast/client/cache/**/*"
+          - shard: client-map
+            module: hazelcast-client
+            tests: "com/hazelcast/client/map/**/*"
+          - shard: client-quorum
+            module: hazelcast-client
+            tests: "com/hazelcast/client/quorum/**/*"
+          - shard: client-a
+            module: hazelcast-client
+            tests: "com/hazelcast/client/spi/**/*, com/hazelcast/client/config/**/*, com/hazelcast/client/txn/**/*, com/hazelcast/client/cp/**/*, com/hazelcast/client/listeners/**/*, com/hazelcast/client/impl/**/*, com/hazelcast/client/executor/**/*, com/hazelcast/client/replicatedmap/**/*"
+          - shard: client-rest
+            module: hazelcast-client
+            tests: "**/*, !com/hazelcast/client/cache/**, !com/hazelcast/client/map/**, !com/hazelcast/client/quorum/**, !com/hazelcast/client/spi/**, !com/hazelcast/client/config/**, !com/hazelcast/client/txn/**, !com/hazelcast/client/cp/**, !com/hazelcast/client/listeners/**, !com/hazelcast/client/impl/**, !com/hazelcast/client/executor/**, !com/hazelcast/client/replicatedmap/**"
+          - shard: spring-buildutils-all
+            module: hazelcast-build-utils,hazelcast-spring,hazelcast-all
+            tests: ""
+    name: test (${{ matrix.shard }})
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "8"
+          cache: maven
+      - name: Install Maven ${{ env.MAVEN_VERSION }} and settings
+        run: |
+          cat > "$RUNNER_TEMP/skipped_report.py" <<'PYEOF'
+          """Print every skipped test (with its reason) and a pass/fail tally from the
+          Surefire XML reports, so the job log names each skip instead of only a count."""
+          import glob
+          import xml.etree.ElementTree as ET
+
+          totals = {"tests": 0, "failures": 0, "errors": 0, "skipped": 0}
+          skipped = []
+          for path in sorted(glob.glob("**/target/surefire-reports/TEST-*.xml", recursive=True)):
+              try:
+                  root = ET.parse(path).getroot()
+              except ET.ParseError:
+                  continue
+              for key in totals:
+                  totals[key] += int(root.get(key, "0") or 0)
+              for case in root.iter("testcase"):
+                  node = case.find("skipped")
+                  if node is not None:
+                      reason = node.get("message") or (node.text or "").strip() or "no message (@Ignore / assumption)"
+                      skipped.append("%s.%s: %s" % (case.get("classname"), case.get("name"), reason))
+
+          for line in skipped:
+              print("SKIPPED " + line)
+          passed = totals["tests"] - totals["failures"] - totals["errors"] - totals["skipped"]
+          print(
+              "Surefire totals: tests=%d passed=%d failures=%d errors=%d skipped=%d"
+              % (totals["tests"], passed, totals["failures"], totals["errors"], totals["skipped"])
+          )
+          PYEOF
+          curl -fsSL "https://archive.apache.org/dist/maven/maven-3/${MAVEN_VERSION}/binaries/apache-maven-${MAVEN_VERSION}-bin.tar.gz" | tar xz -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/apache-maven-${MAVEN_VERSION}/bin" >> "$GITHUB_PATH"
+          cat > "$RUNNER_TEMP/settings.xml" <<'EOF'
+          <settings>
+            <mirrors>
+              <mirror>
+                <id>sonatype-snapshots-retired</id>
+                <mirrorOf>snapshot-repository</mirrorOf>
+                <url>https://repo.maven.apache.org/maven2</url>
+              </mirror>
+            </mirrors>
+          </settings>
+          EOF
+      - name: Install reactor artifacts (tests run in the next step)
+        run: mvn -B -q -s "$RUNNER_TEMP/settings.xml" clean install $BUILD_PROPS -DskipTests
+      - name: Test shard ${{ matrix.shard }} (mvn test -PparallelTest)
+        env:
+          TESTS: ${{ matrix.tests }}
+        run: |
+          if [ -n "$TESTS" ]; then
+            mvn -B -s "$RUNNER_TEMP/settings.xml" test -pl "${{ matrix.module }}" $BUILD_PROPS $TEST_PROPS "-Dtest=$TESTS, $EXCL"
+          else
+            mvn -B -s "$RUNNER_TEMP/settings.xml" test -pl "${{ matrix.module }}" $BUILD_PROPS $TEST_PROPS
+          fi
+      - name: List skipped tests with reasons
+        if: always()
+        run: python3 "$RUNNER_TEMP/skipped_report.py"
